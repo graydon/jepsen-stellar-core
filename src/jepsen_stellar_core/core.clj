@@ -3,6 +3,7 @@
   (:require [clj-http.client :as http]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [clojure.tools.logging :refer [warn info debug]]
             [jepsen.os.debian :as debian]
             [jepsen [client :as client]
              [core :as jepsen]
@@ -13,7 +14,6 @@
              [nemesis :as nemesis]
              [generator :as gen]
              [util :refer [timeout meh]]]))
-
 
 ;; Bunch of random node keypairs ("identities")
 
@@ -30,21 +30,19 @@
         :pub "GB3WGEHMELIWXSYCNOQ3OZ4CTSKGSNDYIMZYVG6OHNDYABLESPZI7CJQ"}})
 
 
-;; Configuration loading
 
-(defn expand-config [node]
-  (let [others (sort (filter (fn [x] (not= x node)) (keys nodes)))
-        sec ((nodes node) :sec)]
-    (-> (io/resource "stellar-core.cfg")
-        slurp
-        (str/replace #"%VALIDATION_SEED%" sec)
-        (str/replace #"%SELF%" (name node))
-        (str/replace #"%OTHER1%" (name (nth others 0)))
-        (str/replace #"%OTHER2%" (name (nth others 1)))
-        (str/replace #"%OTHER3%" (name (nth others 2)))
-        (str/replace #"%OTHER4%" (name (nth others 3)))
-        ;; ... more here
-        )))
+(def ^:dynamic *stellar-core-version*
+  "0.0.1-132-4654e395")
+
+(def stellar-core-deb-url-path
+  "https://s3.amazonaws.com/stellar.org/releases/stellar-core")
+
+(defn stellar-core-deb [version]
+  (<< "stellar-core-~{version}_amd64.deb"))
+
+(defn stellar-core-deb-url [version]
+  (<< "~{stellar-core-deb-url-path}/~(stellar-core-deb version)"))
+
 
 
 ;; Basic mechanisms for talking to a stellar-core server's test port
@@ -91,17 +89,121 @@
 
 
 
+(defn install!
+  [node version]
+  (when-not (debian/installed? :libpq5)
+    (debian/update!)
+    (debian/install '(:libpq5)))
+  (when-not (debian/installed? :stellar-core)
+    (c/su
+     (c/exec :wget :--no-clobber (stellar-core-deb-url version))
+     (c/exec :dpkg :-i (stellar-core-deb version)))))
+
+(defn configure!
+  [node]
+  (let [self (nodes node)
+        others (vec (sort (filter #(not= %1 node) (keys nodes))))]
+
+    (c/upload "/root/.ssh/known_hosts"
+              "/root/.ssh/id_rsa"
+              "/root/.ssh/id_rsa.pub"
+              "/root/.ssh")
+    (c/su
+     (c/exec :echo
+             (slurp (io/resource "stellar-core"))
+             :> "/etc/init.d/stellar-core")
+     (c/exec :chmod :0755 "/etc/init.d/stellar-core")
+     (c/exec :echo
+             (-> (io/resource "stellar-core.cfg")
+                 slurp
+                 (str/replace #"%VALIDATION_SEED%" (:sec self))
+                 (str/replace #"%PUBKEY(\d)%"
+                              (fn [[_ n]] ((nodes (keyword (str "n" n))) :pub)))
+                 (str/replace #"%SELF%" (name node))
+                 (str/replace #"%OTHER(\d)%"
+                              (fn [[_ n]] (name (others (- (read-string n) 1))))))
+             :> "stellar-core.cfg"))))
+
+(defn wipe!
+  []
+  (c/su
+   (if (debian/installed? :stellar-core)
+     (debian/uninstall! :stellar-core))
+   (c/exec :rm :-f
+           "/etc/init.d/stellar-core"
+           "/root/.ssh/known_hosts"
+           "/root/.ssh/id_rsa"
+           "/root/.ssh/id_rsa.pub")
+   (c/exec :rm :-rf :history :buckets :stellar.db :stellar-core.cfg :stellar-core.log)))
+
+(defn initialize!
+  [node]
+  (c/su
+   (c/exec :stellar-core :--conf :stellar-core.cfg :--newhist node)
+   (c/exec :stellar-core :--conf :stellar-core.cfg :--newdb)
+   (c/exec :stellar-core :--conf :stellar-core.cfg :--forcescp)))
+
+;; Configuration loading
+
 ;; For jepsen to manage a server, we must reify the db/DB protocol
 (defn db
   [version]
   (reify db/DB
-    (setup!    [db test node])
-    (teardown! [db test node])))
+    (setup! [db test node]
+      (wipe!)
+      (install! node version)
+      (configure! node)
+      (initialize! node)
+      (c/exec :service :stellar-core :start))
+
+    (teardown! [db test node]
+      (c/su
+       (c/exec :service :stellar-core :stop)))
+    ))
 
 
 ;; For jepsen to apply operations, we must reify client/Client
-(def client
+(defn client
+  [node]
   (reify client/Client
-    (setup!    [this test node] this)
+    (setup!    [this test node] (client node))
     (teardown! [this test])
-    (invoke!   [this test op] (assoc op :type :ok))))
+    (invoke!   [this test op]
+      (case (:f op)
+
+        :read
+        (binding [*server-host* node]
+          (assoc op
+                 :type :ok,
+                 :value (get-account (:id op))))
+
+        :add
+        (binding [*server-host* node]
+          (do-create-account (:id op))
+          (assoc op :type :ok))
+
+        :transfer
+        (binding [*server-host* node]
+          (let [{:keys [from to amount]} op]
+            (do-payment from to amount)
+            (assoc op :type :ok)))
+
+        ))))
+
+
+(defn simple-test
+  [version]
+  (assoc tests/noop-test
+         :name "stellar-core"
+         :os debian/os
+         :db (db version)
+         :client (client nil)
+         :generator (gen/concat
+                     (gen/once {:type :info, :f :start})
+                     (gen/once {:type :invoke,
+                                :f :add,
+                                :id :account1})
+                     (gen/once {:type :info, :f :stop})
+                     )
+         :nemesis nemesis/noop
+         :checker checker/unbridled-optimism))
