@@ -91,13 +91,15 @@
 
 (defn install!
   [node version]
-  (when-not (debian/installed? :libpq5)
+  (when-not (debian/installed? :libpq5:amd64)
     (debian/update!)
-    (debian/install '(:libpq5)))
-  (when-not (debian/installed? :stellar-core)
-    (c/su
-     (c/exec :wget :--no-clobber (stellar-core-deb-url version))
-     (c/exec :dpkg :-i (stellar-core-deb version)))))
+    (debian/install '(:libpq5:amd64)))
+  (when-not (debian/installed? :libsqlite3-0:amd64)
+    (debian/update!)
+    (debian/install '(:libsqlite3-0:amd64)))
+  (when-not (debian/installed? :stellar-core:amd64)
+    (c/exec :wget :--no-clobber (stellar-core-deb-url version))
+    (c/exec :dpkg :-i (stellar-core-deb version))))
 
 (defn configure!
   [node]
@@ -108,40 +110,38 @@
               "/root/.ssh/id_rsa"
               "/root/.ssh/id_rsa.pub"
               "/root/.ssh")
-    (c/su
-     (c/exec :echo
-             (slurp (io/resource "stellar-core"))
-             :> "/etc/init.d/stellar-core")
-     (c/exec :chmod :0755 "/etc/init.d/stellar-core")
-     (c/exec :echo
-             (-> (io/resource "stellar-core.cfg")
-                 slurp
-                 (str/replace #"%VALIDATION_SEED%" (:sec self))
-                 (str/replace #"%PUBKEY(\d)%"
-                              (fn [[_ n]] ((nodes (keyword (str "n" n))) :pub)))
-                 (str/replace #"%SELF%" (name node))
-                 (str/replace #"%OTHER(\d)%"
-                              (fn [[_ n]] (name (others (- (read-string n) 1))))))
-             :> "stellar-core.cfg"))))
+    (c/exec :echo
+            (slurp (io/resource "stellar-core"))
+            :> "/etc/init.d/stellar-core")
+    (c/exec :chmod :0755 "/etc/init.d/stellar-core")
+    (c/exec :echo
+            (-> (io/resource "stellar-core.cfg")
+                slurp
+                (str/replace #"%VALIDATION_SEED%" (:sec self))
+                (str/replace #"%PUBKEY(\d)%"
+                             (fn [[_ n]] ((nodes (keyword (str "n" n))) :pub)))
+                (str/replace #"%SELF%" (name node))
+                (str/replace #"%OTHER(\d)%"
+                             (fn [[_ n]] (name (others (- (read-string n) 1))))))
+            :> "stellar-core.cfg")))
 
 (defn wipe!
   []
-  (c/su
-   (if (debian/installed? :stellar-core)
-     (debian/uninstall! :stellar-core))
-   (c/exec :rm :-f
-           "/etc/init.d/stellar-core"
-           "/root/.ssh/known_hosts"
-           "/root/.ssh/id_rsa"
-           "/root/.ssh/id_rsa.pub")
-   (c/exec :rm :-rf :history :buckets :stellar.db :stellar-core.cfg :stellar-core.log)))
+  (try (c/exec :service :stellar-core :stop))
+  (if (debian/installed? :stellar-core)
+    (debian/uninstall! :stellar-core))
+  (c/exec :rm :-f
+          "/etc/init.d/stellar-core"
+          "/root/.ssh/known_hosts"
+          "/root/.ssh/id_rsa"
+          "/root/.ssh/id_rsa.pub")
+  (c/exec :rm :-rf :history :buckets :stellar.db :stellar-core.cfg :stellar-core.log))
 
 (defn initialize!
   [node]
-  (c/su
-   (c/exec :stellar-core :--conf :stellar-core.cfg :--newhist node)
-   (c/exec :stellar-core :--conf :stellar-core.cfg :--newdb)
-   (c/exec :stellar-core :--conf :stellar-core.cfg :--forcescp)))
+  (c/exec :stellar-core :--conf :stellar-core.cfg :--newhist node)
+  (c/exec :stellar-core :--conf :stellar-core.cfg :--newdb)
+  (c/exec :stellar-core :--conf :stellar-core.cfg :--forcescp))
 
 ;; Configuration loading
 
@@ -154,11 +154,11 @@
       (install! node version)
       (configure! node)
       (initialize! node)
+      (jepsen/synchronize test)
       (c/exec :service :stellar-core :start))
 
     (teardown! [db test node]
-      (c/su
-       (c/exec :service :stellar-core :stop)))
+      (try (c/exec :service :stellar-core :stop)))
     ))
 
 
