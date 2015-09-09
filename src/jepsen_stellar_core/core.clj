@@ -13,7 +13,7 @@
              [checker :as checker]
              [nemesis :as nemesis]
              [generator :as gen]
-             [util :refer [timeout meh]]]))
+             [util :refer [timeout meh log-op]]]))
 
 ;; Bunch of random node keypairs ("identities")
 
@@ -127,7 +127,7 @@
 
 (defn wipe!
   []
-  (try (c/exec :service :stellar-core :stop))
+  (meh (c/exec :service :stellar-core :stop))
   (if (debian/installed? :stellar-core)
     (debian/uninstall! :stellar-core))
   (c/exec :rm :-f
@@ -158,7 +158,7 @@
       (c/exec :service :stellar-core :start))
 
     (teardown! [db test node]
-      (try (c/exec :service :stellar-core :stop)))
+      (meh (c/exec :service :stellar-core :stop)))
     ))
 
 
@@ -171,25 +171,60 @@
     (invoke!   [this test op]
       (case (:f op)
 
-        :read
-        (binding [*server-host* node]
+        :get-account
+        (binding [*server-host* (name node)]
           (assoc op
                  :type :ok,
                  :value (get-account (:id op))))
 
-        :add
-        (binding [*server-host* node]
+        :create-account
+        (binding [*server-host* (name node)]
           (do-create-account (:id op))
           (assoc op :type :ok))
 
-        :transfer
-        (binding [*server-host* node]
+        :payment
+        (binding [*server-host* (name node)]
           (let [{:keys [from to amount]} op]
             (do-payment from to amount)
             (assoc op :type :ok)))
 
         ))))
 
+(def num-accounts 20)
+
+(defn account-id [n]
+  (keyword (<< "account~{n}")))
+
+(defn rand-account []
+  (account-id (rand-int num-accounts)))
+
+(defn gen-create-account [n]
+  (gen/once
+   {:type :invoke
+    :f :create-account
+    :id (account-id n)}))
+
+(defn gen-client []
+  (gen/clients
+   (gen/phases
+    (gen/seq
+     (map gen-create-account (range num-accounts)))
+    (gen/limit
+     100
+     (fn [] {:type :invoke
+             :f :payment
+             :from (rand-account)
+             :to (rand-account)
+             :amount 10})))))
+
+(defn gen-nemesis []
+  (gen/limit
+   10
+   (gen/seq
+    (cycle [(gen/sleep 1)
+            {:type :info :f :start}
+            (gen/sleep 1)
+            {:type :info :f :stop}]))))
 
 (defn simple-test
   [version]
@@ -198,12 +233,7 @@
          :os debian/os
          :db (db version)
          :client (client nil)
-         :generator (gen/concat
-                     (gen/once {:type :info, :f :start})
-                     (gen/once {:type :invoke,
-                                :f :add,
-                                :id :account1})
-                     (gen/once {:type :info, :f :stop})
-                     )
+         :generator (gen/nemesis (gen-nemesis)
+                                 (gen-client))
          :nemesis nemesis/noop
          :checker checker/unbridled-optimism))
