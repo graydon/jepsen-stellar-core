@@ -3,6 +3,7 @@
   (:require [clj-http.client :as http]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [clojure.set :as set]
             [clojure.tools.logging :refer [warn info debug]]
             [jepsen.os.debian :as debian]
             [jepsen [client :as client]
@@ -12,6 +13,7 @@
              [control :as c :refer [|]]
              [checker :as checker]
              [nemesis :as nemesis]
+             [model :as model]
              [generator :as gen]
              [util :refer [timeout meh log-op]]]))
 
@@ -62,6 +64,12 @@
 (defn server-info []
   (-> (get-json "info") :body :info))
 
+(defn ledger-num []
+  (-> (server-info) :ledger :num))
+
+(defn server-status []
+  (:state (server-info)))
+
 (defn server-metrics []
   (-> (get-json "metrics") :body :metrics))
 
@@ -71,6 +79,8 @@
 (defn get-account [who]
   (-> (get-json "testacc" {:name who}) :body))
 
+(defn has-account [who]
+  (-> (get-account who) (contains? :seqnum)))
 
 (defn payment-qp [from to amount]
   {:from from
@@ -91,14 +101,24 @@
 
 (defn install!
   [node version]
-  (when-not (debian/installed? :libpq5:amd64)
+  (when-not (or
+             (debian/installed? :libpq5)
+             (debian/installed? :libpq5:amd64))
     (debian/update!)
     (debian/install '(:libpq5:amd64)))
-  (when-not (debian/installed? :libsqlite3-0:amd64)
+  (when-not (or
+             (debian/installed? :libsqlite3-0)
+             (debian/installed? :libsqlite3-0:amd64))
     (debian/update!)
     (debian/install '(:libsqlite3-0:amd64)))
-  (when-not (debian/installed? :stellar-core:amd64)
+  (when-not (and
+             (or
+              ; Different dpkg versions report this slightly differently
+              (debian/installed? :stellar-core:amd64)
+              (debian/installed? :stellar-core))
+             (= (debian/installed-version :stellar-core) version))
     (c/exec :wget :--no-clobber (stellar-core-deb-url version))
+    (meh (debian/uninstall! :stellar-core))
     (c/exec :dpkg :-i (stellar-core-deb version))))
 
 (defn configure!
@@ -106,10 +126,10 @@
   (let [self (nodes node)
         others (vec (sort (filter #(not= %1 node) (keys nodes))))]
 
-    (c/upload "/root/.ssh/known_hosts"
-              "/root/.ssh/id_rsa"
-              "/root/.ssh/id_rsa.pub"
-              "/root/.ssh")
+    (c/upload '("/root/.ssh/known_hosts"
+                "/root/.ssh/id_rsa"
+                "/root/.ssh/id_rsa.pub")
+              "/root/.ssh" :mode 0600)
     (c/exec :echo
             (slurp (io/resource "stellar-core"))
             :> "/etc/init.d/stellar-core")
@@ -128,8 +148,6 @@
 (defn wipe!
   []
   (meh (c/exec :service :stellar-core :stop))
-  (if (debian/installed? :stellar-core)
-    (debian/uninstall! :stellar-core))
   (c/exec :rm :-f
           "/etc/init.d/stellar-core"
           "/root/.ssh/known_hosts"
@@ -154,7 +172,6 @@
       (install! node version)
       (configure! node)
       (initialize! node)
-      (jepsen/synchronize test)
       (c/exec :service :stellar-core :start))
 
     (teardown! [db test node]
@@ -171,51 +188,42 @@
     (invoke!   [this test op]
       (case (:f op)
 
-        :get-account
+        :read
         (binding [*server-host* (name node)]
           (assoc op
                  :type :ok,
-                 :value (get-account (:id op))))
+                 :value (apply sorted-set
+                         (filter (fn [n] (has-account (account-id n)))
+                                 (range num-accounts)))))
 
-        :create-account
+        :add
         (binding [*server-host* (name node)]
-          (do-create-account (:id op))
-          (assoc op :type :ok))
-
-        :payment
-        (binding [*server-host* (name node)]
-          (let [{:keys [from to amount]} op]
-            (do-payment from to amount)
-            (assoc op :type :ok)))
+          (let [v (:value op)
+                id (account-id v)
+                pre-ledger (ledger-num)]
+          (do-create-account id)
+          (while (< (ledger-num) (+ 3 pre-ledger))
+            (info (<< "awaiting ledger close: node ~(name node) ledger ~(ledger-num) status ~(server-status)"))
+            (Thread/sleep 500))
+          (assoc op :type (if (has-account id) :ok :fail))))
 
         ))))
 
-(def num-accounts 20)
+(def num-accounts 200)
 
 (defn account-id [n]
   (keyword (<< "account~{n}")))
 
-(defn rand-account []
-  (account-id (rand-int num-accounts)))
-
-(defn gen-create-account [n]
-  (gen/once
-   {:type :invoke
-    :f :create-account
-    :id (account-id n)}))
-
 (defn gen-client []
   (gen/clients
    (gen/phases
-    (gen/seq
-     (map gen-create-account (range num-accounts)))
     (gen/limit
-     100
+     10
      (fn [] {:type :invoke
-             :f :payment
-             :from (rand-account)
-             :to (rand-account)
-             :amount 10})))))
+             :f :add
+             :value (rand-int num-accounts)}))
+    (gen/once
+     {:type :invoke :f :read}))))
 
 (defn gen-nemesis []
   (gen/limit
@@ -233,7 +241,8 @@
          :os debian/os
          :db (db version)
          :client (client nil)
+         :model (model/set)
          :generator (gen/nemesis (gen-nemesis)
                                  (gen-client))
          :nemesis nemesis/noop
-         :checker checker/unbridled-optimism))
+         :checker checker/set))
