@@ -6,6 +6,7 @@
             [clojure.set :as set]
             [clojure.tools.logging :refer [warn info debug]]
             [jepsen.os.debian :as debian]
+            [jepsen.control.net :as net]
             [jepsen [client :as client]
              [core :as jepsen]
              [db :as db]
@@ -42,38 +43,38 @@
 (def stellar-core-deb-url-path
   "https://s3.amazonaws.com/stellar.org/releases/stellar-core")
 
-(defn stellar-core-deb [version]
-  (<< "stellar-core-~{version}_amd64.deb"))
+(defn stellar-core-deb []
+  (<< "stellar-core-~{*stellar-core-version*}_amd64.deb"))
 
-(defn stellar-core-deb-url [version]
-  (<< "~{stellar-core-deb-url-path}/~(stellar-core-deb version)"))
+(defn stellar-core-deb-url []
+  (<< "~{stellar-core-deb-url-path}/~(stellar-core-deb)"))
 
 
 
-;; Basic mechanisms for talking to a stellar-core server's test port
+;; Basic mechanisms for talking to a stellar-core node's test port
 
 (def ten-million 10000000)
-(def ^:dynamic *server-host* "localhost")
-(def ^:dynamic *server-port* 11626)
+(def ^:dynamic *node-host* "localhost")
+(def ^:dynamic *node-port* 11626)
 
 (defn get-json [path & [qp]]
   (let [params {:as :json}]
-    (http/get (<< "http://~{*server-host*}:~{*server-port*}/~{path}")
+    (http/get (<< "http://~{*node-host*}:~{*node-port*}/~{path}")
               (if qp
                 (assoc params :query-params qp)
                 params))))
 
 
-(defn server-info []
+(defn node-info []
   (-> (get-json "info") :body :info))
 
 (defn ledger-num []
-  (-> (server-info) :ledger :num))
+  (-> (node-info) :ledger :num))
 
-(defn server-status []
-  (:state (server-info)))
+(defn node-status []
+  (:state (node-info)))
 
-(defn server-metrics []
+(defn node-metrics []
   (-> (get-json "metrics") :body :metrics))
 
 (defn test-tx [qp]
@@ -107,14 +108,17 @@
 (defn do-create-account [to]
   (test-tx (create-account-qp to)))
 
-(defn retry-until [& {:keys [ledgers
-                             retries
-                             f
-                             until]
-                      :or {ledgers 100
-                           retries 100
-                           f #()
-                           until #(or false)}}]
+(defn retry-until
+  "Keep trying the provided `:f` function until the `:until` function
+   passes, or `:ledgers` expire, or `:retries` retries expire. Logs
+   some waiting-for-close noise after the first 20 retries, and slows
+   retrying down a bit. Returns `:ok` if it passed, `:fail` if anything
+   timed out."
+  [& {:keys [ledgers retries f until]
+      :or {ledgers 100
+           retries 100
+           f #()
+           until #(or false)}}]
   (let [first (ledger-num)
         last (+ first ledgers)]
     (loop [retried 0]
@@ -127,7 +131,7 @@
           (> retried 20)
           (do
             (Thread/sleep 800)
-            (info (<< "awaiting close: node ~{*server-host*}, ledger ~{curr}, status ~(server-status)"))
+            (info (<< "awaiting close: node ~{*node-host*}, ledger ~{curr}, status ~(node-status)"))
             (recur (inc retried)))
           true
           (do
@@ -135,7 +139,8 @@
             (recur (inc retried))))))))
 
 (defn install!
-  [node version]
+  "Install stellar-core and its dependencies on a node."
+  [node]
   (when-not (or
              (debian/installed? :libpq5)
              (debian/installed? :libpq5:amd64))
@@ -151,12 +156,15 @@
               ; Different dpkg versions report this slightly differently
               (debian/installed? :stellar-core:amd64)
               (debian/installed? :stellar-core))
-             (= (debian/installed-version :stellar-core) version))
-    (c/exec :wget :--no-clobber (stellar-core-deb-url version))
+             (= (debian/installed-version :stellar-core)
+                *stellar-core-version*))
+    (c/exec :wget :--no-clobber (stellar-core-deb-url))
     (meh (debian/uninstall! :stellar-core))
-    (c/exec :dpkg :-i (stellar-core-deb version))))
+    (c/exec :dpkg :-i (stellar-core-deb))))
 
 (defn configure!
+  "Install keys, init control and config files on a node.
+   Pubkeys are needed to scp history between nodes' history stores."
   [node]
   (let [self (nodes node)
         others (vec (sort (filter #(not= %1 node) (keys nodes))))]
@@ -181,6 +189,7 @@
             :> "stellar-core.cfg")))
 
 (defn wipe!
+  "Wipe a node's state, keys and config files."
   []
   (meh (c/exec :service :stellar-core :stop))
   (c/exec :rm :-f
@@ -191,20 +200,20 @@
   (c/exec :rm :-rf :history :buckets :stellar.db :stellar-core.cfg :stellar-core.log))
 
 (defn initialize!
+  "Initialize history and database on a node."
   [node]
   (c/exec :stellar-core :--conf :stellar-core.cfg :--newhist node)
   (c/exec :stellar-core :--conf :stellar-core.cfg :--newdb)
   (c/exec :stellar-core :--conf :stellar-core.cfg :--forcescp))
 
-;; Configuration loading
 
-;; For jepsen to manage a server, we must reify the db/DB protocol
 (defn db
-  [version]
+  "Standard db/DB reification, for a single node."
+  []
   (reify db/DB
     (setup! [db test node]
       (wipe!)
-      (install! node version)
+      (install! node)
       (configure! node)
       (initialize! node)
       (c/exec :service :stellar-core :start))
@@ -220,8 +229,20 @@
 (def max-account (atom 0))
 (defn account-id [n] (keyword (<< "account~{n}")))
 
-;; For jepsen to apply operations, we must reify client/Client
+
 (defn client
+  "Standard client for `:add` and `:read` operations, modeled by `model/set`.
+  
+  An `{:type :invoke :f :add :value n}` operation causes this client
+  to add an account named `account~{n}` from a funding-account called
+  `(nodenum n)`. That is, `account0`, `account5`, `account10`, etc. are all
+  funded from an intermediate account called `n1`.
+  
+  Splitting the adds up with intermediate accounts allows them to proceed without
+  interfering with one another's sequence numbers; if we didn't do this, most adds
+  would fail (harmlessly, but it's a waste of requests; we want to test adds, not
+  rejections).
+  "
   [node]
   (reify client/Client
     (setup!    [this test node] (client node))
@@ -230,22 +251,22 @@
       (case (:f op)
 
         :setup
-        (binding [*server-host* (name node)]
+        (binding [*node-host* (name node)]
           (let [n (nth nodenames (:value op))]
             (assoc op :type (retry-until
                              :f #(do-create-account n)
                              :until #(has-account n)))))
 
         :read
-        (binding [*server-host* (name node)]
+        (binding [*node-host* (name node)]
           (assoc op
                  :type :ok,
                  :value (apply sorted-set
-                               (filter (fn [n] (has-account (account-id n)))
-                                       (range (+ 1 @max-account))))))
+                               (filter #(has-account (account-id %1))
+                                       (range (inc @max-account))))))
 
         :add
-        (binding [*server-host* (name node)]
+        (binding [*node-host* (name node)]
           (let [v (:value op)
                 id (account-id v)
                 src (nodenum v)]
@@ -286,17 +307,51 @@
   (gen/clients
     (gen/once {:type :invoke, :f :read})))
 
+(defn random-subset
+  "Return a random subset of a collection"
+  [coll]
+  (take (rand-int (inc (count coll))) (shuffle coll)))
 
-;; All our tests follow a simple phase structure: they sync up a new network,
-;; run for 10 minutes ':add'ing sequential accounts and running nemesis disruptions
-;; for 20 seconds every minute (with 40s to recover from each). The network
-;; is then allowed to "fully heal" and a final :read is performed.
+(defn damaged-net-nemesis
+  "Induces network damage on random subset of nodes"
+  [damage & [nodes]]
+  (reify client/Client
+    (setup! [this test _]
+      (let [nodes (random-subset (:nodes test))]
+        (c/on-many nodes (meh (net/fast)))
+        (damaged-net-nemesis damage nodes)))
+
+    (invoke! [this test op]
+      (case (:f op)
+
+        :start
+        (do
+          (c/on-many nodes (damage))
+          (assoc op :value (str "network damaged on " (pr-str nodes))))
+
+        :stop
+        (do
+          (c/on-many nodes (meh (net/fast)))
+          (assoc op :value (str "healed network on " (pr-str nodes))))
+        ))
+
+    (teardown! [this test]
+      (c/on-many nodes (meh (net/fast)))
+      this)))
+
+(defn flaky-net-nemesis [] (damaged-net-nemesis net/flaky))
+(defn slow-net-nemesis [] (damaged-net-nemesis net/slow))
+
 (defn simple-test
-  [version]
+  "All our tests follow a simple phase structure: they `:setup` up a new network,
+  run for 10 minutes `:add`ing sequential accounts and running nemesis disruptions
+  for 20 seconds every minute (with 40s to recover from each). The network
+  is then allowed to fully heal, and a final `:read` is performed."
+  []
   (assoc tests/noop-test
          :name "stellar-core"
          :os debian/os
-         :db (db version)
+         :db (db)
          :client (client nil)
          :model (model/set)
          :generator (gen/phases
@@ -316,32 +371,51 @@
          :nemesis nemesis/noop
          :checker checker/set))
 
-;; Randomly pauses (STOP) and resumes (CONT) nodes on the network
 (defn hammer-test
-  [version]
-  (assoc (simple-test version)
+  "Randomly pauses (STOP) and resumes (CONT) nodes on the network"
+  []
+  (assoc (simple-test)
+         :name "hammer-test"
          :nemesis (nemesis/hammer-time :stellar-core)))
 
-;; Randomly partitions network into [2 nodes] <-> bridge-node <-> [2 nodes]
 (defn bridge-test
-  [version]
-  (assoc (simple-test version)
+  "Randomly partitions network into [2 nodes] <-> bridge-node <-> [2 nodes]"
+  []
+  (assoc (simple-test)
+         :name "bridge-test"
          :nemesis (nemesis/partitioner (comp nemesis/bridge shuffle))))
 
-;; Cuts links such that each node sees a different majority
 (defn majorities-ring-test
-  [version]
-  (assoc (simple-test version)
+  "Cuts links such that each node sees a different majority"
+  []
+  (assoc (simple-test)
+         :name "majorities-ring-test"
          :nemesis (nemesis/partition-majorities-ring)))
 
-;; Randomly partitions network into halves
 (defn random-split-test
-  [version]
-  (assoc (simple-test version)
+  "Randomly partitions network into halves"
+  []
+  (assoc (simple-test)
+         :name "random-split-test"
          :nemesis (nemesis/partition-random-halves)))
 
-;; Randomly split a single node off the group
 (defn random-isolate-test
-  [version]
-  (assoc (simple-test version)
+  "Randomly split a single node off the group"
+  []
+  (assoc (simple-test)
+         :name "random-isolate-test"
          :nemesis (nemesis/partition-random-node)))
+
+(defn flaky-net-test
+  "Make network connections randomly flaky"
+  []
+  (assoc (simple-test)
+         :name "flaky-net-test"
+         :nemesis (flaky-net-nemesis)))
+
+(defn slow-net-test
+  "Make network connections randomly slow"
+  []
+  (assoc (simple-test)
+         :name "slow-net-test"
+         :nemesis (slow-net-nemesis)))
