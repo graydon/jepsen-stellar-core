@@ -31,7 +31,10 @@
    :n5 {:sec "SBTQU46R47J2CDU65E32AITEN6XE7QETQLILAB2LGG3AZ6AE4ZWVBSMB"
         :pub "GB3WGEHMELIWXSYCNOQ3OZ4CTSKGSNDYIMZYVG6OHNDYABLESPZI7CJQ"}})
 
+(def nodenames (sort (keys nodes)))
 
+(defn nodenum [n]
+  (nth nodenames (rem n (count nodenames))))
 
 (def ^:dynamic *stellar-core-version*
   "0.0.1-132-4654e395")
@@ -88,16 +91,48 @@
    :amount amount})
 
 (defn create-account-qp [to]
-  (assoc (payment-qp "root" to (* 1000 ten-million))
+  (assoc (payment-qp "root" to (* 10000 ten-million))
+         :create 'true))
+
+(defn create-account-from-qp [from to]
+  (assoc (payment-qp from to (* 100 ten-million))
          :create 'true))
 
 (defn do-payment [from to amount]
   (test-tx (payment-qp from to amount)))
 
+(defn do-create-account-from [from to]
+  (test-tx (create-account-from-qp from to)))
+
 (defn do-create-account [to]
   (test-tx (create-account-qp to)))
 
-
+(defn retry-until [& {:keys [ledgers
+                             retries
+                             f
+                             until]
+                      :or {ledgers 100
+                           retries 100
+                           f #()
+                           until #(or false)}}]
+  (let [first (ledger-num)
+        last (+ first ledgers)]
+    (loop [retried 0]
+      (let [curr (ledger-num)]
+        (f)
+        (cond
+          (until) :ok
+          (> curr last) :fail
+          (> retried retries) :fail
+          (> retried 20)
+          (do
+            (Thread/sleep 800)
+            (info (<< "awaiting close: node ~{*server-host*}, ledger ~{curr}, status ~(server-status)"))
+            (recur (inc retried)))
+          true
+          (do
+            (Thread/sleep 300)
+            (recur (inc retried))))))))
 
 (defn install!
   [node version]
@@ -178,6 +213,12 @@
       (meh (c/exec :service :stellar-core :stop)))
     ))
 
+;; We dynamically track the max-account to read-back during any test.
+;; This number only ever increases; it's harmless if it's "too high",
+;; we just do a bunch of unsuccessful queries to nonexistent high values
+;; at the end of a test.
+(def max-account (atom 0))
+(defn account-id [n] (keyword (<< "account~{n}")))
 
 ;; For jepsen to apply operations, we must reify client/Client
 (defn client
@@ -188,52 +229,68 @@
     (invoke!   [this test op]
       (case (:f op)
 
+        :setup
+        (binding [*server-host* (name node)]
+          (let [n (nth nodenames (:value op))]
+            (assoc op :type (retry-until
+                             :f #(do-create-account n)
+                             :until #(has-account n)))))
+
         :read
         (binding [*server-host* (name node)]
           (assoc op
                  :type :ok,
                  :value (apply sorted-set
-                         (filter (fn [n] (has-account (account-id n)))
-                                 (range num-accounts)))))
+                               (filter (fn [n] (has-account (account-id n)))
+                                       (range (+ 1 @max-account))))))
 
         :add
         (binding [*server-host* (name node)]
           (let [v (:value op)
                 id (account-id v)
-                pre-ledger (ledger-num)]
-          (do-create-account id)
-          (while (< (ledger-num) (+ 3 pre-ledger))
-            (info (<< "awaiting ledger close: node ~(name node) ledger ~(ledger-num) status ~(server-status)"))
-            (Thread/sleep 500))
-          (assoc op :type (if (has-account id) :ok :fail))))
-
+                src (nodenum v)]
+            (assoc op :type (retry-until
+                             :f #(do-create-account-from src id)
+                             :until #(has-account id)))))
         ))))
 
-(def num-accounts 200)
+(defn setup
+  "Generator that invokes :setup on every node, once, single-threaded"
+  []
+  (gen/singlethreaded
+   (apply gen/concat
+          (map (fn [node] (gen/on (fn [process] (= process node))
+                               (gen/once {:type :invoke :f :setup :value node})))
+               (range (count nodenames))))))
 
-(defn account-id [n]
-  (keyword (<< "account~{n}")))
+(defn adds
+  "Generator that emits :add operations for sequential integers."
+  []
+  (->> (range)
+       (map (fn [x]
+              (swap! max-account (fn [e] (max e x)))
+              {:type :invoke, :f :add, :value x}))
+       gen/seq))
 
-(defn gen-client []
+(defn recover
+  "A generator which stops the nemesis and allows some time for recovery."
+  []
+  (gen/nemesis
+    (gen/phases
+      (gen/once {:type :info, :f :stop})
+      (gen/sleep 20))))
+
+(defn read-once
+  "A generator which reads exactly once."
+  []
   (gen/clients
-   (gen/phases
-    (gen/limit
-     10
-     (fn [] {:type :invoke
-             :f :add
-             :value (rand-int num-accounts)}))
-    (gen/once
-     {:type :invoke :f :read}))))
+    (gen/once {:type :invoke, :f :read})))
 
-(defn gen-nemesis []
-  (gen/limit
-   10
-   (gen/seq
-    (cycle [(gen/sleep 1)
-            {:type :info :f :start}
-            (gen/sleep 1)
-            {:type :info :f :stop}]))))
 
+;; All our tests follow a simple phase structure: they sync up a new network,
+;; run for 10 minutes ':add'ing sequential accounts and running nemesis disruptions
+;; for 20 seconds every minute (with 40s to recover from each). The network
+;; is then allowed to "fully heal" and a final :read is performed.
 (defn simple-test
   [version]
   (assoc tests/noop-test
@@ -242,7 +299,49 @@
          :db (db version)
          :client (client nil)
          :model (model/set)
-         :generator (gen/nemesis (gen-nemesis)
-                                 (gen-client))
+         :generator (gen/phases
+                     (setup)
+                     (->> (adds)
+                          (gen/stagger 1/10)
+                          (gen/delay 1)
+                          (gen/nemesis
+                           (gen/seq (cycle
+                                     [(gen/sleep 40)
+                                      {:type :info :f :start}
+                                      (gen/sleep 20)
+                                      {:type :info :f :stop}])))
+                          (gen/time-limit 600))
+                     (recover)
+                     (read-once))
          :nemesis nemesis/noop
          :checker checker/set))
+
+;; Randomly pauses (STOP) and resumes (CONT) nodes on the network
+(defn hammer-test
+  [version]
+  (assoc (simple-test version)
+         :nemesis (nemesis/hammer-time :stellar-core)))
+
+;; Randomly partitions network into [2 nodes] <-> bridge-node <-> [2 nodes]
+(defn bridge-test
+  [version]
+  (assoc (simple-test version)
+         :nemesis (nemesis/partitioner (comp nemesis/bridge shuffle))))
+
+;; Cuts links such that each node sees a different majority
+(defn majorities-ring-test
+  [version]
+  (assoc (simple-test version)
+         :nemesis (nemesis/partition-majorities-ring)))
+
+;; Randomly partitions network into halves
+(defn random-split-test
+  [version]
+  (assoc (simple-test version)
+         :nemesis (nemesis/partition-random-halves)))
+
+;; Randomly split a single node off the group
+(defn random-isolate-test
+  [version]
+  (assoc (simple-test version)
+         :nemesis (nemesis/partition-random-node)))
